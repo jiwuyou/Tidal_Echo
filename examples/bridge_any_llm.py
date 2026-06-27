@@ -10,11 +10,15 @@ vLLM …)当「AI 大脑」。前端 PWA 和 relay 后端原样不动。
 消息时动一次:
 
     ① SSE 长连  GET  {RELAY}/channel/in?since={cursor}   收人类消息(实时)
-    ② 拉最近 N 条历史拼成 messages + persona(system),调你的模型
+    ② 用内存维护的近期对话 + persona(system),调你的模型(OpenAI 格式)
     ③ POST       {RELAY}/channel/out  {"type":"reply","text":...}   回复回手机
 
-零第三方依赖(只用 Python 标准库)。配置全走环境变量,可放在同目录 .env
-(见 examples/.env.example)。跑起来:
+首次启动会拉一次历史做「暖启动」上下文,并把游标设到当前最新一条 —— 所以
+**不会回放/重答你过去的旧消息**,只应答启动之后的新消息。重启则从上次游标
+继续,补答断线期间漏掉的。
+
+零第三方依赖(只用 Python 标准库,3.7+)。配置全走环境变量,可放在同目录
+.env(见 .env.example)。跑起来:
 
     cp .env.example .env   &&   # 填好 RELAY_URL / RELAY_SECRET / LLM_* 三件
     python3 bridge_any_llm.py
@@ -23,12 +27,15 @@ vLLM …)当「AI 大脑」。前端 PWA 和 relay 后端原样不动。
    bridge —— 两个都会收到同一条消息、都会回复,用户会看到双重回复。
 """
 
+from __future__ import annotations  # 让类型注解不在运行时求值,兼容 Python 3.7+
+
+import collections
 import json
 import os
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -52,7 +59,7 @@ _load_dotenv(Path(__file__).resolve().parent / ".env")
 RELAY_URL = os.environ.get("RELAY_URL", "").rstrip("/")          # 你的域名 + nginx /relay 前缀
 SECRET    = os.environ.get("RELAY_SECRET", "")                   # 必须和后端 relay.env 一致
 CHAT_ID   = os.environ.get("RELAY_CHAT_ID", "me")               # 单用户通道,固定 "me"
-HISTORY_N = int(os.environ.get("HISTORY_N", "12"))             # 喂给模型的最近对话条数
+HISTORY_N = int(os.environ.get("HISTORY_N", "12"))             # 喂给模型的最近对话「轮」数
 TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
 HTTP_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "120"))
 
@@ -68,7 +75,7 @@ if not PERSONA:
     PERSONA = "你是对方的 AI 伴侣,在一个私密的一对一聊天里。说话自然、简短、有温度,像在用手机聊天,不要长篇大论。"
 
 # 模型链:主模型 + 可选兜底(LLM_*_2 / _3)。任一返回 FALLBACK_CODES 就顺次切下一个。
-def _model_routes():
+def _model_routes() -> list:
     routes = []
     for suffix in ("", "_2", "_3"):
         base = os.environ.get(f"LLM_API_BASE{suffix}", "").rstrip("/")
@@ -84,6 +91,10 @@ FALLBACK_CODES = {401, 403, 404, 408, 409, 429, 500, 502, 503, 504}
 # 断线重连游标:只处理 id > cursor 的消息;重连带 ?since=cursor 让 relay 补发。
 STATE_DIR = Path(os.environ.get("BRIDGE_STATE_DIR", Path.home() / ".companion-bridge"))
 CURSOR_FILE = STATE_DIR / "last_in_id"
+
+# 内存里的滚动对话上下文(避免依赖 relay 历史端点的分页语义 —— 它返回的是「最早」
+# 而非「最近」N 条)。收到的人类消息和自己发的回复都 append 进来,喂模型时取尾部。
+convo: "collections.deque[dict]" = collections.deque(maxlen=max(HISTORY_N * 2, 8))
 
 
 def log(tag: str, msg: str) -> None:
@@ -104,7 +115,7 @@ def _require_config() -> None:
 # relay I/O
 # ---------------------------------------------------------------------------
 
-def _auth():
+def _auth() -> dict:
     return {"Authorization": f"Bearer {SECRET}"}
 
 
@@ -125,34 +136,50 @@ def relay_post_json(path: str, body: dict):
         return json.loads(txt) if txt else {}
 
 
-def send_reply(text: str, reply_to: str | None = None) -> None:
+def send_reply(text: str) -> None:
     """AI 的回复 → 落库 + 扇出到 PWA。"""
-    body = {"type": "reply", "chat_id": CHAT_ID, "text": text,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    if reply_to:
-        body["reply_to"] = reply_to
-    out = relay_post_json("/channel/out", body)
+    out = relay_post_json("/channel/out", {
+        "type": "reply", "chat_id": CHAT_ID, "text": text,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
     log("out", f"replied (id={out.get('id')})")
 
 
 # ---------------------------------------------------------------------------
-# 上下文:拉历史 → OpenAI messages
+# 历史 → 内存上下文
 # ---------------------------------------------------------------------------
 
+def _row_to_msg(m: dict):
+    """把一条 relay 历史/消息转成 OpenAI message;不该进上下文的返回 None。"""
+    text = (m.get("text") or "").strip()
+    if not text or m.get("kind") == "call":         # 跳过通话开始/结束这类系统事件
+        return None
+    if m.get("from") == "human":
+        return {"role": "user", "content": text}     # 含语音转写(🎤 …)
+    if m.get("from") == "ai" and m.get("kind") == "reply":
+        return {"role": "assistant", "content": text}  # 跳过 thinking/act 等中间态
+    return None
+
+
+def load_history() -> tuple:
+    """翻页拉全部历史 → (近期对话 messages, 最新一条的 id)。relay 的 history 是
+    `id > since ASC LIMIT`,所以从 0 往后翻页直到取完,再取尾部当上下文。"""
+    rows, since = [], 0
+    while True:
+        page = relay_get_json(f"/app/history?since={since}&limit=500").get("messages", [])
+        if not page:
+            break
+        rows.extend(page)
+        since = page[-1]["id"]
+        if len(page) < 500:
+            break
+    max_id = rows[-1]["id"] if rows else 0
+    msgs = [mm for m in rows if (mm := _row_to_msg(m))]
+    return msgs[-convo.maxlen:], max_id
+
+
 def build_messages() -> list:
-    """persona(system) + 最近 HISTORY_N 条对话。最后一条就是人类刚发的这句。"""
-    rows = relay_get_json(f"/app/history?since=0&limit={HISTORY_N}").get("messages", [])
-    rows = rows[-HISTORY_N:]
-    messages = [{"role": "system", "content": PERSONA}]
-    for m in rows:
-        text = (m.get("text") or "").strip()
-        if not text:
-            continue
-        if m.get("from") == "human":
-            messages.append({"role": "user", "content": text})       # 含语音转写(🎤 …)
-        elif m.get("from") == "ai" and m.get("kind") == "reply":
-            messages.append({"role": "assistant", "content": text})   # 跳过 thinking/act 等中间态
-    return messages
+    return [{"role": "system", "content": PERSONA}] + list(convo)
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +236,14 @@ def handle_human_message(msg: dict) -> None:
     if not content:
         return
     log("in", f"#{msg.get('id')}: {content[:60]}")
+    convo.append({"role": "user", "content": content})
     try:
         reply = call_llm(build_messages())
     except Exception as e:
         log("err", f"生成失败: {e}")
         return
     if reply:
+        convo.append({"role": "assistant", "content": reply})
         send_reply(reply)
 
 
@@ -237,8 +266,7 @@ def write_cursor(i: int) -> None:
         pass
 
 
-def stream_inbound() -> None:
-    cursor = read_cursor()
+def stream_inbound(cursor: int) -> None:
     backoff = 1
     while True:
         try:
@@ -248,7 +276,7 @@ def stream_inbound() -> None:
             with urllib.request.urlopen(req, timeout=90) as resp:
                 log("in", f"stream connected (since={cursor})")
                 backoff = 1
-                data_lines = []
+                data_lines: list = []
                 for raw in resp:
                     line = raw.decode("utf-8", "replace").rstrip("\r\n")
                     if line.startswith("data:"):
@@ -258,15 +286,15 @@ def stream_inbound() -> None:
                             continue
                         payload, data_lines = "\n".join(data_lines), []
                         try:
-                            msg = json.loads(payload)
+                            m = json.loads(payload)
                         except json.JSONDecodeError:
                             continue
-                        if msg.get("type") == "ping" or "id" not in msg:
+                        if m.get("type") == "ping" or "id" not in m:
                             continue
-                        mid = int(msg.get("id") or 0)
+                        mid = int(m.get("id") or 0)
                         if mid <= cursor:                 # 重连补发里已处理过的,跳过
                             continue
-                        handle_human_message(msg)
+                        handle_human_message(m)
                         cursor = mid
                         write_cursor(cursor)              # 只在处理后推进游标
             log("in", "stream ended → reconnect")
@@ -279,7 +307,18 @@ def stream_inbound() -> None:
 def main() -> None:
     _require_config()
     log("boot", f"relay={RELAY_URL}  models={[r['model'] for r in MODEL_ROUTES]}  history={HISTORY_N}")
-    stream_inbound()
+    cursor = read_cursor()
+    # 暖启动:拉历史填上下文,并把全新部署的游标设到「当前最新」——不回放/重答旧消息。
+    try:
+        ctx, max_id = load_history()
+        convo.extend(ctx)
+        if cursor == 0:
+            cursor = max_id
+            write_cursor(cursor)
+        log("boot", f"warm-start: {len(convo)} msgs in context, cursor={cursor}")
+    except Exception as e:
+        log("boot", f"history warm-start skipped ({e})")
+    stream_inbound(cursor)
 
 
 if __name__ == "__main__":

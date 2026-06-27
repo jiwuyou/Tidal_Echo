@@ -123,7 +123,7 @@ WARNING: Loading development channels
   ```
   (保险起见可在前 20 秒内每 2 秒 `send-keys -t cc Enter` 送几次;多余的空回车落在输入框无害。)
 
-- **Windows(无 tmux)**:用 `AttachConsole(pid) + WriteConsoleInput` 往 CC 的子控制台注入回车。可直接用 [`examples/confirm_dev_channel_win.py`](examples/confirm_dev_channel_win.py)(实战验证过的最小实现:启动 CC 后开个后台线程,2~20 秒内每 2 秒送一次回车,`try/except` 包住,失败不影响 CC)。
+- **Windows(无 tmux)**:用 `AttachConsole(pid) + WriteConsoleInput` 往 CC 的子控制台注入回车。可直接用 [`examples/confirm_dev_channel_win.py`](examples/confirm_dev_channel_win.py)(源自实战做法的最小独立实现:启动 CC 后开后台线程,2~20 秒内每 2 秒送一次回车,`try/except` 包住,失败不影响 CC;未覆盖所有 Windows/CC 版本,按需调 window/interval)。
 
 - **通用兜底**:`expect` / `pexpect` 包住启动命令,匹配到 `WARNING: Loading development channels` 就送 `\r`。
 

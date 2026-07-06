@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+ROOT="/root/Tidal_Echo"
+exec /usr/bin/python3 "$ROOT/scripts/bailian_asr_transcribe.py" "$@"

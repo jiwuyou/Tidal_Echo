@@ -824,6 +824,12 @@
   @keyframes send-go{ from{ transform: scale(.96); } to{ transform: scale(1); } }
   .floatbtn.send.send-go{ animation: send-go .22s cubic-bezier(.2,.8,.2,1); }
   @media (prefers-reduced-motion: reduce){ .floatbtn.send.send-go{ animation: none; } }
+  .floatbtn.mic-recording{
+    color: #ffffff;
+    background: var(--call-hangup-bg);
+    box-shadow: 0 10px 26px var(--call-hangup-shadow);
+  }
+  .floatbtn.mic-recording svg{ transform: scale(.92); }
   .composer .field{
     flex:1 1 auto; display:flex; align-items:center; gap: clamp(4px, 0.8vw, 10px);
     background: var(--field-bg);
@@ -2524,8 +2530,10 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
   let secs = 0, tickId = null, hideId = null, rafId = null;
   let waveBuilt = false;
   let bars = [];
-  let recognition = null, recognitionWanted = false, recognitionRestart = null;
-  let mediaStream = null, mediaRecorder = null;
+  let recognition = null, recognitionWanted = false, recognitionRestart = null, recognitionFallbackTimer = null;
+  let realtimeWs = null, realtimeCtx = null, realtimeSource = null, realtimeProcessor = null, realtimeGain = null;
+  let realtimeExpectedClose = false, realtimeStarted = false;
+  let mediaStream = null, mediaRecorder = null, recorderSegmentTimer = null;
   let audioCtx = null, analyser = null, freqData = null;
   let speakingUtterance = null;
   let ttsAudio = null, ttsUrl = "", speakTimeout = null, resumeTimer = null;
@@ -2735,6 +2743,7 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
   function stopRecognition(){
     recognitionWanted = false;
     if (recognitionRestart){ clearTimeout(recognitionRestart); recognitionRestart = null; }
+    if (recognitionFallbackTimer){ clearTimeout(recognitionFallbackTimer); recognitionFallbackTimer = null; }
     if (recognition){
       try{ recognition.onend = null; recognition.abort(); }catch(e){}
       recognition = null;
@@ -2762,7 +2771,7 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
     resumeTimer = setTimeout(() => {
       resumeTimer = null;
       if (!open || mediaRecorder) return;
-      startRecognition();
+      void startVoiceInput();
     }, delay);
   }
 
@@ -2774,6 +2783,190 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
       .catch(() => {
         setTranscript("没送出去,等下网络好了再说一次。", false);
       });
+  }
+
+  function switchToRecorderFallback(message){
+    if (!open || mediaRecorder) return;
+    stopRealtimeAsr(true);
+    if (recognitionFallbackTimer){ clearTimeout(recognitionFallbackTimer); recognitionFallbackTimer = null; }
+    recognitionWanted = false;
+    if (recognitionRestart){ clearTimeout(recognitionRestart); recognitionRestart = null; }
+    if (recognition){
+      try{ recognition.onend = null; recognition.abort(); }catch(e){}
+      recognition = null;
+    }
+    setTranscript(message || "浏览器语音识别不可用,改用录音转写。", true);
+    void startRecorderFallback();
+  }
+
+  function scheduleRecognitionFallback(delay = 12000){
+    if (recognitionFallbackTimer) clearTimeout(recognitionFallbackTimer);
+    recognitionFallbackTimer = setTimeout(() => {
+      recognitionFallbackTimer = null;
+      if (!open || !recognitionWanted || mediaRecorder) return;
+      switchToRecorderFallback("浏览器没有返回识别结果,改用录音转写。");
+    }, delay);
+  }
+
+  function realtimeAsrUrl(){
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const qs = new URLSearchParams({ token: secret || "" });
+    if (callId) qs.set("call_id", callId);
+    return `${proto}//${location.host}${API_BASE}/app/asr-stream?${qs.toString()}`;
+  }
+
+  function downsampleTo16k(buffer, inputRate){
+    const outputRate = 16000;
+    if (!buffer || !buffer.length) return new Float32Array(0);
+    if (!inputRate || inputRate === outputRate) return buffer;
+    const ratio = inputRate / outputRate;
+    const newLength = Math.max(1, Math.round(buffer.length / ratio));
+    const result = new Float32Array(newLength);
+    let offset = 0;
+    for (let i = 0; i < newLength; i++){
+      const nextOffset = Math.round((i + 1) * ratio);
+      let acc = 0, count = 0;
+      for (let j = offset; j < nextOffset && j < buffer.length; j++){
+        acc += buffer[j];
+        count++;
+      }
+      result[i] = count ? acc / count : 0;
+      offset = nextOffset;
+    }
+    return result;
+  }
+
+  function pcm16Buffer(floatBuffer){
+    const out = new ArrayBuffer(floatBuffer.length * 2);
+    const view = new DataView(out);
+    for (let i = 0; i < floatBuffer.length; i++){
+      let s = Math.max(-1, Math.min(1, floatBuffer[i] || 0));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return out;
+  }
+
+  function cleanupRealtimeAudio(){
+    if (realtimeProcessor){
+      try{ realtimeProcessor.onaudioprocess = null; realtimeProcessor.disconnect(); }catch(e){}
+    }
+    if (realtimeSource){ try{ realtimeSource.disconnect(); }catch(e){} }
+    if (realtimeGain){ try{ realtimeGain.disconnect(); }catch(e){} }
+    if (realtimeCtx){ try{ realtimeCtx.close(); }catch(e){} }
+    realtimeProcessor = null; realtimeSource = null; realtimeGain = null; realtimeCtx = null;
+  }
+
+  function stopRealtimeAsr(expectClose = true){
+    realtimeExpectedClose = expectClose;
+    realtimeStarted = false;
+    cleanupRealtimeAudio();
+    if (realtimeWs){
+      try{
+        if (realtimeWs.readyState === WebSocket.OPEN) realtimeWs.send(JSON.stringify({ type:"finish" }));
+      }catch(e){}
+      try{ realtimeWs.close(); }catch(e){}
+    }
+    realtimeWs = null;
+  }
+
+  async function startRealtimeAsr(){
+    if (!window.WebSocket) return false;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
+    stopRealtimeAsr(true);
+    try{
+      if (!mediaStream) {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+        });
+        await startWaveMeter(mediaStream);
+      }
+    }catch(e){
+      return false;
+    }
+    return await new Promise((resolve) => {
+      let settled = false;
+      let ws = null;
+      const settle = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (!ok) stopRealtimeAsr(true);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => settle(false), 9000);
+      try{
+        ws = new WebSocket(realtimeAsrUrl());
+      }catch(e){
+        settle(false);
+        return;
+      }
+      realtimeWs = ws;
+      realtimeExpectedClose = false;
+      realtimeStarted = false;
+      ws.binaryType = "arraybuffer";
+      ws.onmessage = async (event) => {
+        let data = null;
+        try{ data = JSON.parse(event.data); }catch(e){ return; }
+        if (data.type === "started"){
+          try{
+            realtimeCtx = new AC();
+            if (realtimeCtx.state === "suspended") await realtimeCtx.resume();
+            realtimeSource = realtimeCtx.createMediaStreamSource(mediaStream);
+            realtimeProcessor = realtimeCtx.createScriptProcessor(4096, 1, 1);
+            realtimeGain = realtimeCtx.createGain();
+            realtimeGain.gain.value = 0;
+            realtimeProcessor.onaudioprocess = (ev) => {
+              if (!open || muted || !realtimeWs || realtimeWs.readyState !== WebSocket.OPEN) return;
+              const input = ev.inputBuffer.getChannelData(0);
+              const pcm = pcm16Buffer(downsampleTo16k(input, realtimeCtx.sampleRate));
+              if (pcm.byteLength) {
+                try{ realtimeWs.send(pcm); }catch(e){}
+              }
+            };
+            realtimeSource.connect(realtimeProcessor);
+            realtimeProcessor.connect(realtimeGain);
+            realtimeGain.connect(realtimeCtx.destination);
+            realtimeStarted = true;
+            setCaption("listening");
+            setTranscript("实时识别已连接。你可以直接说。", true);
+            settle(true);
+          }catch(e){
+            settle(false);
+          }
+          return;
+        }
+        if (data.type === "asr"){
+          const t = String(data.text || "").trim();
+          if (!t) return;
+          setTranscript("你: " + t, !data.final);
+          pulseVu(data.final ? 0.7 : 0.45);
+          return;
+        }
+        if (data.type === "committed"){
+          setCaption("thinking");
+          return;
+        }
+        if (data.type === "error"){
+          console.warn("[asr] realtime error:", data.message || data);
+          if (!settled) settle(false);
+        }
+      };
+      ws.onerror = () => {
+        if (!settled) settle(false);
+      };
+      ws.onclose = () => {
+        const shouldFallback = open && !realtimeExpectedClose && realtimeStarted && !mediaRecorder;
+        realtimeWs = null;
+        cleanupRealtimeAudio();
+        realtimeStarted = false;
+        if (!settled) settle(false);
+        else if (shouldFallback){
+          setTranscript("实时识别断开,改用浏览器识别。", true);
+          if (!startRecognition()) void startRecorderFallback();
+        }
+      };
+    });
   }
 
   function startRecognition(){
@@ -2789,22 +2982,32 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
       if (!open) return;
       setCaption("listening");
       setTranscript("我在听。你可以直接说。", true);
+      scheduleRecognitionFallback();
     };
     recognition.onresult = (event) => {
       let interim = "";
+      let hadFinal = false;
       for (let i = event.resultIndex; i < event.results.length; i++){
         const piece = (event.results[i][0] && event.results[i][0].transcript || "").trim();
         if (!piece) continue;
-        if (event.results[i].isFinal) sendVoiceText(piece, "browser_speech");
+        if (event.results[i].isFinal) {
+          hadFinal = true;
+          sendVoiceText(piece, "browser_speech");
+        }
         else interim += piece;
       }
+      if (hadFinal) scheduleRecognitionFallback(16000);
       if (interim){ setTranscript("你: " + interim, true); pulseVu(0.5 + Math.random() * 0.45); }
     };
     recognition.onerror = (event) => {
       if (!open) return;
       const denied = event && (event.error === "not-allowed" || event.error === "service-not-allowed");
       if (denied) recognitionWanted = false;
-      setTranscript(denied ? "麦克风权限没有打开。" : "语音识别暂时断开,正在重连。", false);
+      if (denied) {
+        setTranscript("麦克风权限没有打开。", false);
+      } else {
+        switchToRecorderFallback("浏览器语音识别暂时不可用,改用录音转写。");
+      }
     };
     recognition.onend = () => {
       if (!open || !recognitionWanted) return;
@@ -2814,6 +3017,7 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
     };
     try{
       recognition.start();
+      scheduleRecognitionFallback();
       return true;
     }catch(e){
       return false;
@@ -2821,6 +3025,7 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
   }
 
   function stopRecorder(){
+    if (recorderSegmentTimer){ clearTimeout(recorderSegmentTimer); recorderSegmentTimer = null; }
     if (mediaRecorder && mediaRecorder.state !== "inactive"){
       try{ mediaRecorder.stop(); }catch(e){}
     }
@@ -2845,16 +3050,39 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
         await startWaveMeter(mediaStream);
       }
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-      mediaRecorder = new MediaRecorder(mediaStream, { mimeType: mime });
-      mediaRecorder.ondataavailable = (event) => {
-        if (!open || !event.data || event.data.size < 1200) return;
-        apiVoiceBlob(event.data, mime, { call_id: callId }).catch(() => {
-          setTranscript("录音片段发送失败。", false);
-        });
+      const startSegment = () => {
+        if (!open || !mediaStream) return;
+        const chunks = [];
+        try{
+          mediaRecorder = new MediaRecorder(mediaStream, { mimeType: mime });
+        }catch(e){
+          setTranscript("录音启动失败。请检查浏览器权限。", false);
+          return;
+        }
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data && event.data.size) chunks.push(event.data);
+        };
+        mediaRecorder.onstop = () => {
+          if (recorderSegmentTimer){ clearTimeout(recorderSegmentTimer); recorderSegmentTimer = null; }
+          const blob = chunks.length ? new Blob(chunks, { type: mime }) : null;
+          mediaRecorder = null;
+          if (open && blob && blob.size >= 1200) {
+            apiVoiceBlob(blob, mime, { call_id: callId }).catch(() => {
+              setTranscript("录音片段发送失败。", false);
+            });
+          }
+          if (open && mediaStream) setTimeout(startSegment, 120);
+        };
+        mediaRecorder.start();
+        recorderSegmentTimer = setTimeout(() => {
+          if (mediaRecorder && mediaRecorder.state === "recording"){
+            try{ mediaRecorder.stop(); }catch(e){}
+          }
+        }, 4200);
       };
-      mediaRecorder.start(4500);
+      startSegment();
       setCaption("recording");
-      setTranscript("正在录音分段发送。若服务器配置了 ASR," + AI_NAME + "会收到转写。", true);
+      setTranscript("正在录音分段转写。", true);
     }catch(e){
       setTranscript("麦克风启动失败。请检查浏览器权限。", false);
     }
@@ -2869,6 +3097,7 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
         await startWaveMeter(mediaStream);
       } catch(e) {}
     }
+    if (await startRealtimeAsr()) return;
     if (!startRecognition()) await startRecorderFallback();
   }
 
@@ -2948,6 +3177,7 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
     setWaveLevel(0);
     speakSeq++;
     stopRecognition();
+    stopRealtimeAsr(true);
     stopRecorder();
     clearSpeechPlayback();
     speakQueue.length = 0;
@@ -2971,6 +3201,7 @@ if (themeSeg) themeSeg.addEventListener("click", e => {
     if (speakBusy || !speakQueue.length || !open) return;
     speakBusy = true;
     stopRecognition();
+    stopRealtimeAsr(true);
     while (speakQueue.length && open){
       const text = speakQueue.shift();
       setCaption("speaking");
@@ -5376,6 +5607,7 @@ window.addEventListener("pointerdown", ensureAudio, { once:true });   // 进页�
 
 /* ════════════ 发送 ════════════ */
 let composing = false;
+let composerStream = null, composerRecorder = null, composerChunks = [], composerStopTimer = null;
 function focusInputWithoutPageScroll(e){
   if (document.activeElement === inputEl) return;
   if (e) e.preventDefault();
@@ -5390,8 +5622,7 @@ inputEl.addEventListener("compositionend",   () => composing = false);
 inputEl.addEventListener("input", () => {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + "px";
-  sendBtn.classList.remove("hidden");
-  micBtn.classList.add("hidden");
+  updateComposerAction();
 });
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !composing){
@@ -5401,6 +5632,98 @@ inputEl.addEventListener("keydown", (e) => {
 });
 inputEl.addEventListener("focus", () => setTimeout(scrollToBottom, 60));
 sendBtn.addEventListener("click", doSend);
+if (micBtn) micBtn.addEventListener("click", () => { void toggleComposerVoice(); });
+
+function updateComposerAction(){
+  const hasText = !!inputEl.value.trim();
+  if (composerRecorder && composerRecorder.state === "recording"){
+    sendBtn.classList.add("hidden");
+    micBtn.classList.remove("hidden");
+    return;
+  }
+  sendBtn.classList.toggle("hidden", !hasText);
+  micBtn.classList.toggle("hidden", hasText);
+}
+
+function resetComposerVoiceUi(){
+  micBtn.classList.remove("mic-recording");
+  micBtn.setAttribute("aria-label", "语音");
+  micBtn.setAttribute("title", "语音");
+  updateComposerAction();
+}
+
+function stopComposerVoiceTracks(){
+  if (composerStream){
+    composerStream.getTracks().forEach((t) => { try{ t.stop(); }catch(_){} });
+  }
+  composerStream = null;
+}
+
+async function startComposerVoice(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder){
+    showToast("这个浏览器不支持录音");
+    return;
+  }
+  ensureAudio();
+  composerChunks = [];
+  try{
+    composerStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+    });
+    const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+    composerRecorder = new MediaRecorder(composerStream, { mimeType: mime });
+    composerRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size) composerChunks.push(event.data);
+    };
+    composerRecorder.onstop = () => {
+      const blob = composerChunks.length ? new Blob(composerChunks, { type: mime }) : null;
+      composerChunks = [];
+      composerRecorder = null;
+      if (composerStopTimer){ clearTimeout(composerStopTimer); composerStopTimer = null; }
+      stopComposerVoiceTracks();
+      resetComposerVoiceUi();
+      if (!blob || blob.size < 1200){
+        showToast("没有录到声音");
+        return;
+      }
+      playSendSound();
+      apiVoiceBlob(blob, mime).then(() => {
+        showToast("语音已发送");
+      }).catch((err) => {
+        if (String(err.message) === "401") return;
+        showToast(String(err.message) === "413" ? "语音太长" : "语音发送失败");
+      });
+    };
+    composerRecorder.start();
+    micBtn.classList.add("mic-recording");
+    micBtn.classList.remove("hidden");
+    sendBtn.classList.add("hidden");
+    micBtn.setAttribute("aria-label", "停止录音并发送");
+    micBtn.setAttribute("title", "停止并发送");
+    showToast("正在录音");
+    composerStopTimer = setTimeout(() => { void stopComposerVoice(); }, 20000);
+  }catch(_){
+    composerRecorder = null;
+    stopComposerVoiceTracks();
+    resetComposerVoiceUi();
+    showToast("麦克风启动失败");
+  }
+}
+
+async function stopComposerVoice(){
+  if (composerStopTimer){ clearTimeout(composerStopTimer); composerStopTimer = null; }
+  if (composerRecorder && composerRecorder.state === "recording"){
+    try{ composerRecorder.stop(); }catch(_){}
+  } else {
+    stopComposerVoiceTracks();
+    resetComposerVoiceUi();
+  }
+}
+
+async function toggleComposerVoice(){
+  if (composerRecorder && composerRecorder.state === "recording") await stopComposerVoice();
+  else await startComposerVoice();
+}
 
 function triggerSendPress(){
   if (!sendBtn) return;
@@ -5417,8 +5740,7 @@ async function doSend(){
   ensureAudio();                 // 手势内解锁/预热音频
   inputEl.value = "";
   inputEl.style.height = "auto";
-  sendBtn.classList.remove("hidden");
-  micBtn.classList.add("hidden");
+  updateComposerAction();
 
   const optimisticTs = Date.now();
   const tempKey = "pending-" + (++optimisticSeq);
@@ -5443,6 +5765,8 @@ async function doSend(){
     setMessage({ ...optimistic, status:"failed" });
   }
 }
+
+updateComposerAction();
 
 /* ════════════ 附件发送 ════════════ */
 const ATT_MAX = 10 * 1024 * 1024;

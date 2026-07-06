@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+ROOT="/root/Tidal_Echo"
+exec "$ROOT/.venv-asr/bin/python" "$ROOT/scripts/vosk_transcribe.py" "$@"

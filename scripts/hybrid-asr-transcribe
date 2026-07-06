@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+ROOT="/root/Tidal_Echo"
+
+if { [ -n "${DASHSCOPE_API_KEY:-}" ] || [ -n "${BAILIAN_API_KEY:-}" ]; } && \
+   { [ -n "${BAILIAN_WORKSPACE_ID:-}" ] || [ -n "${BAILIAN_ASR_ENDPOINT:-}" ]; }; then
+  if "$ROOT/scripts/bailian-asr-transcribe" "$@"; then
+    exit 0
+  fi
+fi
+
+exec "$ROOT/scripts/vosk-transcribe" "$@"

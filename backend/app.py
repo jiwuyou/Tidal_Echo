@@ -26,14 +26,16 @@ import re
 import secrets
 import subprocess
 import sqlite3
+import sys
 import urllib.error
 import urllib.request
 import urllib.parse
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -43,6 +45,11 @@ except Exception:  # a missing lib must not stop the relay from starting
     webpush = None
     class WebPushException(Exception):
         pass
+
+try:
+    import websockets
+except Exception:
+    websockets = None
 
 
 # --- identity (parameterized — set these to your own names) ----------------
@@ -62,6 +69,15 @@ ALLOW_ORIGINS = [o.strip() for o in os.environ.get(
 MAX_UPLOAD_BYTES = int(os.environ.get("RELAY_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 VOICE_MAX_BYTES = int(os.environ.get("RELAY_VOICE_MAX_BYTES", str(8 * 1024 * 1024)))
 VOICE_TRANSCRIBE_CMD = os.environ.get("RELAY_VOICE_TRANSCRIBE_CMD", "")
+
+# --- Aliyun Bailian Fun-ASR realtime WebSocket (optional) -------------------
+BAILIAN_API_KEY = os.environ.get("BAILIAN_API_KEY") or os.environ.get("DASHSCOPE_API_KEY", "")
+BAILIAN_WORKSPACE_ID = os.environ.get("BAILIAN_WORKSPACE_ID", "")
+BAILIAN_REALTIME_ASR_WS_ENDPOINT = os.environ.get("BAILIAN_REALTIME_ASR_WS_ENDPOINT", "")
+BAILIAN_REALTIME_ASR_MODEL = os.environ.get("BAILIAN_REALTIME_ASR_MODEL", "fun-asr-realtime")
+BAILIAN_REALTIME_ASR_SAMPLE_RATE = int(os.environ.get("BAILIAN_REALTIME_ASR_SAMPLE_RATE", "16000"))
+BAILIAN_REALTIME_ASR_LANGUAGE = os.environ.get("BAILIAN_REALTIME_ASR_LANGUAGE", "zh")
+BAILIAN_REALTIME_ASR_MAX_SILENCE = int(os.environ.get("BAILIAN_REALTIME_ASR_MAX_SILENCE", "800"))
 
 # --- MiniMax TTS (optional — leave keys blank to disable spoken replies) ----
 MINIMAX_API_BASE = os.environ.get("MINIMAX_API_BASE", "https://api.minimaxi.com")
@@ -512,9 +528,13 @@ def transcribe_with_command(audio_path: Path, mime: str) -> str:
             timeout=45,
             check=False,
         )
-    except Exception:
+    except Exception as exc:
+        print(f"[voice] transcribe command failed to start: {exc}", file=sys.stderr)
         return ""
     if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if detail:
+            print(f"[voice] transcribe command exited {proc.returncode}: {detail[:1000]}", file=sys.stderr)
         return ""
     return proc.stdout.strip()
 
@@ -620,6 +640,93 @@ def check_auth(request: Request) -> None:
     token = auth[7:] if auth.startswith("Bearer ") else request.query_params.get("token")
     if not token or not hmac.compare_digest(token, SECRET):
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def check_ws_auth(websocket: WebSocket) -> bool:
+    token = websocket.query_params.get("token") or ""
+    return bool(token and hmac.compare_digest(token, SECRET))
+
+
+def bailian_realtime_asr_endpoint() -> str:
+    if BAILIAN_REALTIME_ASR_WS_ENDPOINT:
+        return BAILIAN_REALTIME_ASR_WS_ENDPOINT
+    if BAILIAN_WORKSPACE_ID:
+        return f"wss://{BAILIAN_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+    return "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+
+
+def bailian_realtime_run_task(task_id: str) -> dict:
+    params = {
+        "format": "pcm",
+        "sample_rate": BAILIAN_REALTIME_ASR_SAMPLE_RATE,
+        "semantic_punctuation_enabled": False,
+        "max_sentence_silence": BAILIAN_REALTIME_ASR_MAX_SILENCE,
+    }
+    if BAILIAN_REALTIME_ASR_LANGUAGE:
+        params["language_hints"] = [BAILIAN_REALTIME_ASR_LANGUAGE]
+    return {
+        "header": {
+            "action": "run-task",
+            "task_id": task_id,
+            "streaming": "duplex",
+        },
+        "payload": {
+            "task_group": "audio",
+            "task": "asr",
+            "function": "recognition",
+            "model": BAILIAN_REALTIME_ASR_MODEL,
+            "parameters": params,
+            "input": {},
+        },
+    }
+
+
+def bailian_realtime_finish_task(task_id: str) -> dict:
+    return {
+        "header": {
+            "action": "finish-task",
+            "task_id": task_id,
+            "streaming": "duplex",
+        },
+        "payload": {"input": {}},
+    }
+
+
+async def bailian_ws_connect(url: str, headers: dict):
+    if websockets is None:
+        raise RuntimeError("python package 'websockets' is not installed")
+    kwargs = {
+        "ping_interval": 20,
+        "ping_timeout": 20,
+        "max_size": 8 * 1024 * 1024,
+    }
+    try:
+        return await websockets.connect(url, additional_headers=headers, **kwargs)
+    except TypeError:
+        return await websockets.connect(url, extra_headers=headers, **kwargs)
+
+
+async def publish_realtime_voice_text(text: str, call_id: str = "") -> dict:
+    clean = (text or "").strip()
+    if not clean:
+        return {}
+    shown = clean if clean.startswith("🎤") else "🎤 " + clean
+    meta = {
+        "user": "human",
+        "voice": True,
+        "source": "bailian_realtime",
+        "transcribed": True,
+    }
+    if call_id:
+        meta["call_id"] = call_id
+    msg = save_message("in", "voice", shown, meta)
+    if brain_target() == "loop":
+        asyncio.create_task(forward_to_loop(msg))
+    else:
+        await broadcast(plugin_subs, plugin_payload(msg))
+    await broadcast(app_subs, app_payload(msg))
+    await broadcast(app_subs, {"type": "typing", "active": True})
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -776,7 +883,12 @@ async def app_voice(request: Request):
     stored = Path(upload["url"]).name
     local_audio = UPLOAD_DIR / stored
     transcript = transcribe_with_command(local_audio, mime)
-    text = ("🎤 " + transcript) if transcript else f"🎤 [语音] {HUMAN_NAME}发来一段语音；当前 relay 未配置 ASR，音频已作为附件送达。"
+    if transcript:
+        text = "🎤 " + transcript
+    elif VOICE_TRANSCRIBE_CMD:
+        text = f"🎤 [语音] {HUMAN_NAME}发来一段语音；ASR 未识别出文字或转写失败，音频已作为附件送达。"
+    else:
+        text = f"🎤 [语音] {HUMAN_NAME}发来一段语音；当前 relay 未配置 ASR，音频已作为附件送达。"
     meta = {
         "user": "human",
         "voice": True,
@@ -789,6 +901,162 @@ async def app_voice(request: Request):
     await broadcast(app_subs, app_payload(msg))
     await broadcast(app_subs, {"type": "typing", "active": True})
     return {"id": msg["id"], "text": transcript, "attachment": upload}
+
+
+@app.websocket("/app/asr-stream")
+async def app_asr_stream(websocket: WebSocket):
+    """Browser mic PCM -> Bailian Fun-ASR realtime -> voice messages."""
+    if not check_ws_auth(websocket):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    if not BAILIAN_API_KEY:
+        await websocket.send_json({"type": "error", "message": "bailian api key not configured"})
+        await websocket.close(code=1011)
+        return
+
+    task_id = str(uuid.uuid4())
+    call_id = (websocket.query_params.get("call_id") or "").strip()[:80]
+    headers = {
+        "Authorization": f"Bearer {BAILIAN_API_KEY}",
+        "user-agent": "tidal-echo-relay/1.0",
+    }
+    if BAILIAN_WORKSPACE_ID:
+        headers["X-DashScope-WorkSpace"] = BAILIAN_WORKSPACE_ID
+
+    bailian = None
+    finish_sent = False
+
+    async def send_finish():
+        nonlocal finish_sent
+        if finish_sent or bailian is None:
+            return
+        finish_sent = True
+        try:
+            await bailian.send(json.dumps(bailian_realtime_finish_task(task_id), ensure_ascii=False))
+        except Exception:
+            pass
+
+    async def client_to_bailian():
+        while True:
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                await send_finish()
+                return
+            mtype = msg.get("type")
+            if mtype == "websocket.disconnect":
+                await send_finish()
+                return
+            if mtype == "websocket.receive":
+                data = msg.get("bytes")
+                text = msg.get("text")
+                if data:
+                    await bailian.send(data)
+                elif text:
+                    try:
+                        payload = json.loads(text)
+                    except Exception:
+                        payload = {}
+                    if payload.get("type") == "finish":
+                        await send_finish()
+                        return
+
+    async def bailian_to_client():
+        seen_final: set[tuple[int, str]] = set()
+        async for raw in bailian:
+            if isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            header = data.get("header") or {}
+            event = header.get("event") or ""
+            if event == "result-generated":
+                sentence = ((data.get("payload") or {}).get("output") or {}).get("sentence") or {}
+                if sentence.get("heartbeat"):
+                    continue
+                text = (sentence.get("text") or "").strip()
+                if not text:
+                    continue
+                final = bool(sentence.get("sentence_end"))
+                sentence_id = int(sentence.get("sentence_id") or 0)
+                await websocket.send_json({
+                    "type": "asr",
+                    "text": text,
+                    "final": final,
+                    "sentence_id": sentence_id,
+                })
+                if final:
+                    key = (sentence_id, text)
+                    if key not in seen_final:
+                        seen_final.add(key)
+                        msg = await publish_realtime_voice_text(text, call_id)
+                        if msg:
+                            await websocket.send_json({"type": "committed", "id": msg.get("id"), "text": text})
+            elif event == "task-finished":
+                await websocket.send_json({"type": "finished"})
+                return
+            elif event == "task-failed":
+                message = header.get("error_message") or header.get("error_code") or "bailian asr failed"
+                await websocket.send_json({"type": "error", "message": message})
+                return
+
+    try:
+        bailian = await bailian_ws_connect(bailian_realtime_asr_endpoint(), headers)
+        await bailian.send(json.dumps(bailian_realtime_run_task(task_id), ensure_ascii=False))
+        while True:
+            raw = await asyncio.wait_for(bailian.recv(), timeout=15)
+            if isinstance(raw, (bytes, bytearray)):
+                continue
+            data = json.loads(raw)
+            header = data.get("header") or {}
+            event = header.get("event") or ""
+            if event == "task-started":
+                await websocket.send_json({"type": "started"})
+                break
+            if event == "task-failed":
+                message = header.get("error_message") or header.get("error_code") or "bailian asr failed"
+                await websocket.send_json({"type": "error", "message": message})
+                return
+
+        client_task = asyncio.create_task(client_to_bailian())
+        bailian_task = asyncio.create_task(bailian_to_client())
+        done, pending = await asyncio.wait({client_task, bailian_task}, return_when=asyncio.FIRST_COMPLETED)
+        if bailian_task in done:
+            client_task.cancel()
+        else:
+            try:
+                await asyncio.wait_for(bailian_task, timeout=25)
+            finally:
+                if not bailian_task.done():
+                    bailian_task.cancel()
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc:
+                raise exc
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[asr-stream] failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        try:
+            await websocket.send_json({"type": "error", "message": f"asr stream failed: {type(exc).__name__}"})
+        except Exception:
+            pass
+    finally:
+        await send_finish()
+        if bailian is not None:
+            try:
+                await bailian.close()
+            except Exception:
+                pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.post("/app/call")

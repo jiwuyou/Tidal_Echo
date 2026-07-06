@@ -105,6 +105,7 @@ claude --dangerously-load-development-channels server:companion
 启动后 stderr 出现 `[companion:boot] connected ...`，在 PWA 发一条 → CC 会话里冒出 `<channel source="companion" ...>` → 让 AI 调 `reply(chat_id="me", text="...")` → 手机收到气泡。**全链路通。**
 
 > ⚠️ 这个 flag 启动时 CC **每次会弹一个确认框**（DevChannelsDialog），无人值守会卡住。自动过的办法见 **[AGENTS.md §4](AGENTS.md)**：Linux 用 `tmux send-keys`，Windows 用 [`examples/confirm_dev_channel_win.py`](examples/confirm_dev_channel_win.py)。
+> 安全建议：生产或长期运行时，建议让 Claude Code 跑在专用的非 root 用户下；权限、配置迁移、日志排查见 **[docs/claude-code-nonroot.md](docs/claude-code-nonroot.md)**。
 > 🔀 **不用 Claude Code 的话跳过这一步**，改用 [`examples/bridge_any_llm.py`](examples/bridge_any_llm.py) 接任意 LLM API。
 
 ---
